@@ -131,6 +131,9 @@ class OuterProductCell(params : OPUParameters)(implicit p: Parameters) extends C
 class OuterProductUnit(params: OPUParameters)(implicit p : Parameters) extends IterativeFunctionalUnit()(p)  {
   // Control signals from sequencer
   val cntrl_io = IO(new OuterProductIO(params, dLen, egsTotal, egsPerVReg))
+  val synmap_io = IO(new Bundle{
+    val YOU_SHALL_PASS = Output(Bool())
+  })
 
   // Extract data from issued instruction
   val in0 = WireInit(UInt(dLen.W), 0.U)
@@ -304,9 +307,8 @@ class OuterProductUnit(params: OPUParameters)(implicit p : Parameters) extends I
   io.set_fflags.valid := false.B
   io.set_fflags.bits := DontCare
   
-  val YOU_SHALL_PASS = Wire(Bool())
-  YOU_SHALL_PASS := in0(0) & in1(1)
-  dontTouch(YOU_SHALL_PASS)
+  synmap_io.YOU_SHALL_PASS := in0(0) & in1(1)
+  dontTouch(synmap_io.YOU_SHALL_PASS)
 }
 
 
