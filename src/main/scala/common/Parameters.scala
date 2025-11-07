@@ -353,6 +353,7 @@ case class VectorParams(
   enableScalarVectorAddrDisambiguation: Boolean = true,
 
   doubleBufferSegments: Boolean = false,
+  bufferStdata: Boolean = false, // adds a buffer between the backend and store segmenter
 
   vrfBanking: Int = 2,
   vrfHiccupBuffer: Boolean = true,

@@ -16,17 +16,16 @@ void i8_mm_scalar(int32_t* c_bias, int32_t* c_out, int8_t* at, int8_t* b, size_t
     }
   }
 }
-
 void i32_init(int32_t* d, size_t s) {
   for (size_t i = 0; i < s; i++) {
-    d[i] = i + 1;
+    // d[i] = i + 1;
+    d[i] = 0;
   }
 }
-
 void i8_init(int8_t* d, size_t s, int8_t start) {
     for (size_t i = 0; i < s; i++) {
-      // d[i] = (i + start) % 127; // keep values small to avoid overflow
-      d[i] = 0;
+      d[i] = (i + start) % 127; // keep values small to avoid overflow
+      // d[i] = 0;
     }
   }
 
@@ -64,7 +63,7 @@ int main(void) {
   printf("maxvl=%lu; dl=%lu\n", maxvl, dl);
 
   const size_t M = 3*maxvl;
-  const size_t N = 3*maxvl;
+  const size_t N = 4*maxvl;
   const size_t K = 3;
   int8_t at[M*K];
   int8_t b[N*K];
@@ -81,7 +80,7 @@ int main(void) {
         size_t k = K;
         printf("Testing M=%ld, N=%ld, K=%ld\n", m, n, k);
         i8_mm_scalar(c_bias, c_ref, at, b, m, n, k);
-        i8_mm_bme_1x2(c_bias, c_opu, at, b, m, n, k);
+        i8_mm_bme_lm2(c_bias, c_opu, at, b, m, n, k);
         
         // verify against reference
         int r = 0;      
