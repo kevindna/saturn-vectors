@@ -21,11 +21,11 @@ case class OPUParameters (
   val bWidth : Int = 8,
   val cWidth : Int = 32, // Accumulator size
 
-  val nMrfRegs : Int = 4
+  val nMrfRegs : Int = 2
 )
 
 trait HasOPUParams extends HasVectorParams { this: HasCoreParameters =>
-  def maxLMUL = 2 // TODO: make this dynamic
+  def maxLMUL = 2 // TODO: test =min(sqrt(nMrfRegs, 2)
   def regsPerTileReg = (vLen/dLen) * (vLen/dLen)
   def regsPerCell = regsPerTileReg * opuParams.nMrfRegs
   def cellRegIdxBits = log2Ceil(regsPerCell)
