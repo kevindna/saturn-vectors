@@ -51,6 +51,7 @@ class OuterProductSequencer(implicit p: Parameters) extends Sequencer[OuterProdu
   val mvin_bcast = Reg(Bool())
   val mvout = Reg(Bool())
   val macc = Reg(Bool())
+  val k_reduce = Reg(UInt(2.W))
 
   val scalar_row_idx = inst.rs1_data
   val scalar_cluster_row_idx = (scalar_row_idx >> log2Ceil(clusterYdim))(log2Ceil(yDim)-1,0)
@@ -58,7 +59,7 @@ class OuterProductSequencer(implicit p: Parameters) extends Sequencer[OuterProdu
   val scalar_row_latency = ((yDim+1).U - scalar_cluster_row_idx)
 
   // maccs use both col_idx and row_idx, mvins/mvouts use col_idx only
-  val col_idx = Reg(UInt(log2Ceil(wideningFactor * (vLen / dLen)).W))
+  val col_idx = Reg(UInt(log2Ceil(wideningFactor * (vLen / dLen)).W)) // wideningFactor because cluster is based upon single output of single cell (i.e. accumulator size which is determined by wideningFactor)
   val row_idx = Reg(UInt(log2Ceil(vLen / dLen).W))
 
   val renv1 = macc
@@ -70,11 +71,21 @@ class OuterProductSequencer(implicit p: Parameters) extends Sequencer[OuterProdu
   val col_idx_tail = next_col_idx === Mux(macc, (vLen / dLen).U, (wideningFactor * vLen / dLen).U)
   val row_idx_tail = next_row_idx === (vLen / dLen).U
 
-  val macc_tail = col_idx_tail && row_idx_tail
+  col_idx_tail = Mux(k_reduce === 2.U, 1.U, Mux(k_reduce === 1.U, 2.U, col_idx_tail))
+  row_idx_tail = Mux(k_reduce =/= 0.U, k_reduce << 1.U, row_idx_tail) // 2^k_reduce is the k value
 
-  val tail = Mux(macc, macc_tail, col_idx_tail)
+  val macc_tail = col_idx_tail && row_idx_tail
+  val k_reduction_tail = col_idx_tail && row_idx_tail
+
+  val tail = Mux(k_reduce =/= 0.U, k_reduction_tail, Mux(macc, macc_tail, col_idx_tail))
 
   io.dis.ready := !valid || (tail && io.iss.fire) && !io.dis_stall
+
+  // TODO: k reduction finite state machine 
+  //    Must perform one/three reductions
+  //    row_idx_tail is ydim/kfactor
+  //    col_idx_tail is 2 for k=2 and 1 for k=4
+  //    Outer loop repeats 1x for k=2, and 3x for k=4
 
   // Take a new instruction
   when (io.dis.fire) {
@@ -90,10 +101,11 @@ class OuterProductSequencer(implicit p: Parameters) extends Sequencer[OuterProdu
     rvs1_mask     := Mux(dis_inst.renv1             , FillInterleaved(egsPerVReg, dis_vs1_arch_mask), 0.U)
     rvs2_mask     := Mux(dis_inst.renv2             , FillInterleaved(egsPerVReg, dis_vs2_arch_mask), 0.U)
     val funct6 = OPMFunct6(dis_inst.funct6)
-    mvin := funct6 === OPMFunct6.opmvin
+    mvin  :=  funct6 === OPMFunct6.opmvin
     mvout :=  funct6 === OPMFunct6.opmvout
-    macc :=  funct6 === OPMFunct6.opmacc
+    macc  :=  funct6 === OPMFunct6.opmacc
     mvin_bcast :=  funct6 === OPMFunct6.opmvinbcast
+    k_reduce := Cat(funct6 === OPMFunct6.opukreduce4, funct6 ===  OPMFunct6.opukreduce2)
     col_idx := 0.U
     row_idx := 0.U
     head := true.B
@@ -231,9 +243,178 @@ class OuterProductSequencer(implicit p: Parameters) extends Sequencer[OuterProdu
     }
   }
 
+  //****************************
+  // K > 1 reduce logic [ONLY k=2 FOR NOW]
+  //****************************
+  val cluster_grp_height  = Reg(UInt(log2Ceil(yDim/2).W)) // Max size is if k=2
+  val cluster_row         = Reg(UInt(log2Ceil(clusterYdim).W))  // Row within cluster
+  val curr_array_row      = Reg(UInt(log2Ceil(yDim).W))      // Row in PE array
+  val translation_cnt     = Reg(UInt(log2Ceil(clusterYdim + yDim/2))) // Max translation is k=2 (yDim/2) and clusterYDim to shift all rows out
+  val translation_amnt    = Reg(UInt(log2Ceil(clusterYdim + yDim/2))) // Max translation is k=2 (yDim/2) and clusterYDim to shift all rows out
+
+  // Register control 
+  when(io.dis.fire) {
+    intra_cnt       := 0.U
+    cluster_row     := 0.U
+    curr_array_row  := 0.U
+    translation_cnt := 0.U
+    clusters        := k/varchRatio
+
+    cluster_grp_height := (clusterYDim*varchRatio/k).U // This can be reduce to yDim >> k_reduce
+    translation_amnt   := (clusterYDim*varchRatio/k).U // Reduction on cluster group alignement, therefore cluster gorup height
+    // cluster_grp_height = MuxLookup(k_reduce, 0.U, // This can be reduce to yDim >> k_reduce
+                                      // Seq(  1.U -> yDim/2
+                                            // 2.U -> yDim/4)) 
+  }
+
+  // val intra_cnt = RegInit(0.U(log2Ceil(varchRatio).W))
+  // val intra_mrf = VecInit((0 until varchRatio).map(i => (varchRatio * i + i).U))
+
+  // when(intra_cnt < varchRatio-1) {
+  //   for (array_row <- 0 until yDim/2) {
+  //     io.iss.bits.in_l(array_row) := 0.U
+  //     io.iss.bits.in_t(array_row) := 0.U
+  
+  //     io.iss.bits.col_idx(array_row) := 1.U // for k=2 case, hardcoded to get second column
+  //     io.iss.bits.row_idx(array_row) := cluster_row
+  //     io.iss.bits.mrf_idx(array_row) := intra_mrf(intra_cnt) // upper-left quadrant for requested matrix register
+
+  //     io.iss.bits.macc(array_row)       := false.B
+  //     io.iss.bits.mvin(array_row)       := false.B
+  //     io.iss.bits.mvin_bcast(array_row) := false.B
+  //     io.iss.bits.shift(array_row)      := false.B
+  //     io.iss.bits.k_reduce(array_row)   := false.B
+
+  //     intra_cnt := intra_cnt + 1.U   // For next cycle
+  //   }
+  // }
+
+
+  // TODO: Combinational to hard because two loops (one nested)
+  // easier as FSM
+
+
+  val IDLE :: INTRA :: INTER :: Nil = Enum(3)
+  val fsm_st = RegInit(IDLE) 
+  val cluster_pairs = RegInit(0.U(log2Ceil(max_kfactor).W))
+
+
+  val kfactor_enable = max_kfactor > 1
+  val k_reduce_shft_reg = Reg(Vec(clusterYdim+1, UInt(1.W))) // Plus one for first register shift
+
+  if (!kfactor_enable) {
+    switch(fsm_st) {
+      is(IDLE) {
+        when ( /* trigger */) {
+          fsm_st := INTRA if varchRatio > 1 else INTER
+        }
+        intra_cnt := 0.U
+        // pairs is half of cluster_groups
+        assert((varchRatio & (varchRatio - 1)) == 0, "varchRatio needs to be a power of two for inner k > 1")
+        cluster_pairs := k >> (log2Ceil(varchRatio) + 1).U   
+      }
+
+      is(INTRA) {
+        when(intra_cnt < varchRatio-1 && k > varchRatio) {
+          fsm_st := INTER
+
+          for (array_row <- 0 until yDim/2) {
+            io.iss.bits.in_l(array_row) := 0.U
+            io.iss.bits.in_t(array_row) := 0.U
+
+            io.iss.bits.col_idx(array_row) := 1.U // for k=2 case, hardcoded to get second column
+            io.iss.bits.row_idx(array_row) := cluster_row
+            io.iss.bits.mrf_idx(array_row) := intra_mrf(intra_cnt) // upper-left quadrant for requested matrix register
+
+            io.iss.bits.macc(array_row)       := false.B
+            io.iss.bits.mvin(array_row)       := false.B
+            io.iss.bits.mvin_bcast(array_row) := false.B
+            io.iss.bits.shift(array_row)      := false.B
+            io.iss.bits.k_reduce(array_row)   := false.B
+
+            intra_cnt := intra_cnt + 1.U   // For next cycle
+          }
+        }
+      }
+
+      is(INTER) {
+        // when(cluster_pairs === 1.U && cluster_row === 3.U) {
+        //   fsm_st := IDLE
+        // } 
+
+        // when(cluster_row === 3.U) {
+        //   cluster_pairs := cluster_pairs >> 2
+        // }
+
+        fsm_st := Mux(cluster_grp_height === yDim.U && /* finished reduction */, IDLE, INTER)
+        cluster_row := Mux(cluster_row === 3.U, 0.U, cluster_row + 1.U)
+        cluster_grp_height := Mux(cluster_row === 3.U, cluster_grp_height << 1.U, cluster_grp_height)
+        translation_cnt    := Mux(translation_cnt-1.U === 0.U, cluster_grp_height, translation_cnt - 1.U)
+
+        // 1. Start with clusters that a cluster_row mod cluster_group_height = 0
+        // (WHEN ZERO-INDEXED; moving even cluster group to odd cluster group
+        // This is discoverable by row/cluster_group_height mod 2, these blocks 
+        // will have their k_reduce asserted at the appropriate time. All blocks
+        // in between selected translated cluster and merge cluster are shift asserted)
+        //  - Send all rows in cluster
+        //  - Increase cluster row by one
+        //  - Repeat until cluster row = cluter_group_height
+        // 2. Increase cluster_group_size by 2x. Repeat step 1
+
+        // Assign each row in the PE array
+        for (j <- 0 until yDim) {
+          io.iss.bits.in_l(j) = 0.U
+          io.iss.bits.in_t(j) = 0.U
+      
+          io.iss.bits.col_idx(j) = 1 // for k=2 case, hardcoded to get second column
+          io.iss.bits.row_idx(j) = cluster_row
+          io.iss.bits.mrf_idx(j) = Cat(inst.rs2, 0.U(1.W), 0.U(1.W)) // upper-left quadrant for requested matrix register
+
+          io.iss.bits.macc(j) = false.B
+          io.iss.bits.mvin(j) = false.B
+          io.iss.bits.mvin_bcast(j) = false.B
+          io.iss.bits.shift(j) = i.U(cluster_grp_height-1 downto 0) =/= 0.U
+          io.iss.bits.k_reduce(j) = k_reduce_shft_reg(j+1) && i.U(cluster_grp_height) === 1.U // Mask for merge cells (index / cluster_grp_height / 2 mod 2 == 1.U )
+          // Cluster translating input one into shift register, and shifting or merging cluster enter zero
+          k_reduce_shft_reg(i+1) = Mux(i.U(cluster_grp_height) === 1.U, // For Merge cluster (they always put zero into the shift register)
+                                        0.U,
+                                        Mux(cluster_row === 0.U, i.U(cluster_grp_height-1 downto 0) =/= 0.U, k_reduce_shft_reg(i))
+                                      )
+
+        }
+
+
+
+      }
+    }
+  }
+  
+
+
+  // Temporal sequencing logic 
+  when(k_reduce =/= 0.U) {
+    for (array_row <- 0 until yDim/2) {
+      io.iss.bits.in_l(array_row) = 0.U
+      io.iss.bits.in_t(array_row) = 0.U
+  
+      io.iss.bits.col_idx(array_row) = 1 // for k=2 case, hardcoded to get second column
+      io.iss.bits.row_idx(array_row) = cluster_row
+      io.iss.bits.mrf_idx(array_row) = Cat(inst.rs2, 0.U(1.W), 0.U(1.W)) // upper-left quadrant for requested matrix register
+
+
+      io.iss.bits.macc(array_row) = false.B
+      io.iss.bits.mvin(array_row) = false.B
+      io.iss.bits.mvin_bcast(array_row) = false.B
+      io.iss.bits.shift(array_row) = false.B
+      io.iss.bits.k_reduce(array_row) = false.B
+    }
+  }
+
+
+
+
+
   io.busy := valid
   io.head := head
   io.tail := tail
 }
-
-

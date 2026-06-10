@@ -58,6 +58,7 @@ object OPMFunct6 extends ChiselEnum {
   val macc = Value
   val opmvout = Value
   val nmsac = Value
+  val opreduce = Value
 
   val waddu, wadd, wsubu, wsub, wadduw, waddw, wsubuw, wsubw, wmulu = Value
   val _ = Value
