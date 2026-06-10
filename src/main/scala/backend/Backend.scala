@@ -355,7 +355,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   // outer product vrf reads
   vopu.foreach { vopu =>
-
+    // OPU is always last execution unit/sequencer
     vrf.io.vxs(flat_vxs.size).rvs1.req <> vos.get.io.rvs1
     vrf.io.vxs(flat_vxs.size).rvs2.req <> vos.get.io.rvs2
     vrf.io.vxs(flat_vxs.size).rvm.req.valid := false.B
@@ -382,6 +382,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           Vec(vopu.xDim * vopu.clusterXdim, UInt(opuParams.bWidth.W))
         )
         for (i <- 0 until vopu.xDim) {
+          // Swizzles the inputs in cluster
           for (j <- 0 until vopu.clusterXdim) {
             vopu_ctrl_reg.in_t(i)(j) := elems(i + j * vopu.xDim)
           }
