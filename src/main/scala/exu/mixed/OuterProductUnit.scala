@@ -39,6 +39,8 @@ trait HasOPUParams extends HasVectorParams { this: HasCoreParameters =>
   def yDim = (dLen / opuParams.aWidth) / clusterYdim
   def xDim = (dLen / opuParams.bWidth) / clusterXdim
 
+  def max_kfactor = 1 // Maximum allowable kfactor
+
 }
 
 
@@ -57,6 +59,9 @@ class OuterProductCell(implicit p: Parameters) extends CoreModule()(p) with HasO
     // Contol Signals
     val mrf_idx = Input(UInt(cellRegIdxBits.W)) // Index for µarch register to write
 
+    val intra_k_reduce = Input(Bool())
+    val inter_k_reduce = Input(Bool())
+
     val macc = Input(Bool())
     val mvin = Input(Bool())
     val mvin_bcast = Input(Bool())
@@ -68,14 +73,28 @@ class OuterProductCell(implicit p: Parameters) extends CoreModule()(p) with HasO
 
   // TODO: Need to check for overflow and saturate to accumulator width
   val prod = Mux(io.macc, io.in_l * io.in_t, 0.S)
-  val sum = prod + regs(io.mrf_idx)
+  val sum = prod + regs(io.mrf_idx)   // Original
+
+  // For inner k greater than 1
+  val k_reduce = io.intra_k_reduce || io.inter_k_reduce
+  val intra_reg_ind = mrf_idx + (varchRatio + 1).U;
+
+  // Selection for adder (mux can be optimized away if max_kfactor = 1, 
+  // be driving constants to inputs)
+  // May be able to reuse io.mvin for io.inter_k_reduce
+  val add_op = Mux(io.intra_k_reduce, regs(intra_reg_ind), 
+               Mux(io.inter_k_reduce, io.mvin_data,
+                                      prod))
+
+  val sum = regs(io.mrf_idx) + add_op // If using k_factor reduce
+
 
   // Data going into MRF
   for (i <- 0 until regsPerCell) {
     val tile_match = (io.mrf_idx >> log2Ceil(regsPerTileReg)) === (i >> log2Ceil(regsPerTileReg)).U
     val subtile_match = io.mrf_idx(log2Ceil(regsPerTileReg)-1,0) === (i % regsPerTileReg).U
 
-    when (tile_match && (((io.mvin || io.macc) && subtile_match) || io.mvin_bcast)) {
+    when (tile_match && (((io.mvin || io.macc || k_reduce) && subtile_match) || io.mvin_bcast)) {
       regs(i) := Mux(io.macc, sum, io.mvin_data)
     }
   }
@@ -83,13 +102,20 @@ class OuterProductCell(implicit p: Parameters) extends CoreModule()(p) with HasO
   io.out := regs(io.mrf_idx)
 }
 
-class OuterProductCluster(implicit p : Parameters) extends CoreModule()(p) with HasOPUParams {
+class OuterProductCluster(row: Int, col: Int)(implicit p : Parameters) extends CoreModule()(p) with HasOPUParams {
+  // val pass_pipes = 1
+  val pass_pipes = 2 if max_kfactor > 2 else 1  // Hardcoded
+  // val pass_pipes = clusterXdim/2 if max_kfactor > 2 else 1 // clusterXdim/2 represents the max number of pipes you would want to move simultaneously
+
   val io = IO(new Bundle{
     val in_l      = Input(Vec(clusterYdim, UInt(opuParams.aWidth.W)))
     val in_t      = Input(Vec(clusterXdim, UInt(opuParams.bWidth.W)))
 
-    val in_pipe   = Input(UInt(opuParams.cWidth.W))
-    val out_pipe  = Output(UInt(opuParams.cWidth.W))
+    val in_pipe   = Input(Vec(pass_pipes, UInt(opuParams.cWidth.W)))
+    val out_pipe  = Output(Vec(pass_pipes, UInt(opuParams.cWidth.W)))
+
+    // val k_reduce  = Input(Bool()) // Indicates that you should be reducing with input for k factor reduction
+    val k_reduce  = Input(UInt(2.W))  // 0 -> k=1, 1 -> k=2, 2 -> k=4 (i.e. k=2^k_reduce)
 
     val mrf_idx = Input(UInt(cellRegIdxBits.W))
     val row_idx = Input(UInt(log2Ceil(clusterYdim).W))
@@ -103,11 +129,14 @@ class OuterProductCluster(implicit p : Parameters) extends CoreModule()(p) with 
 
   val cells = Seq.fill(clusterXdim, clusterYdim)(Module(new OuterProductCell))
   val cell_outs = Wire(Vec(clusterYdim, Vec(clusterXdim, UInt(opuParams.cWidth.W))))
-  val pipe = Reg(UInt(opuParams.cWidth.W))
+  val pipe = Reg(Vec(pass_pipes, UInt(opuParams.cWidth.W)))
 
   for (i <- 0 until clusterYdim) {
     for (j <- 0 until clusterXdim) {
       val cell = cells(i)(j)
+
+      cell.io.inter_k_reduce := k_reduce(0)
+      cell.io.intra_k_reduce := k_reduce(1)
 
       cell.io.in_l  := io.in_l(i).asSInt
       cell.io.in_t  := io.in_t(j).asSInt
@@ -115,18 +144,31 @@ class OuterProductCluster(implicit p : Parameters) extends CoreModule()(p) with 
       cell.io.macc := io.macc
       cell.io.mvin := io.mvin && i.U === io.row_idx && j.U === io.col_idx
       cell.io.mvin_bcast := io.mvin_bcast && j.U === io.col_idx
-      cell.io.mvin_data := io.in_t.asUInt.asSInt
+      // cell.io.mvin_data := io.in_t.asUInt.asSInt
       cell.io.mrf_idx := io.mrf_idx
       cell_outs(i)(j) := cell.io.out.asUInt
+      cell.io.mvin_data := MuxLookup( k_reduce, 
+                                      io.in_t.asUInt.asSInt, 
+                                      Seq(
+                                        0.U -> io.in_t.asUInt.asSInt,
+                                        1.U -> io.in_pipe(0),
+                                        2.U -> io.in_pipe(1)
+                                      ))
     }
   }
 
-  pipe := Mux(io.shift,
-    io.in_pipe,
-    cell_outs(io.row_idx)(io.col_idx)
-  )
 
-  io.out_pipe := pipe
+
+  pipe(0) := Mux(io.shift, io.in_pipe(0), cell_outs(io.row_idx)(io.col_idx))
+  io.out_pipe(0) := pipe(0)
+
+  // For k=2 need to shift two columns
+  // Secondary input, output ports for this case
+  if (max_kfactor >= 2) {
+    pipe(1) := Mux(io.shift, io.in_pipe(1), cell_outs(io.row_idx)(io.col_idx+1)) // Plus 1 should be truncated by the bit width
+    io.out_pipe(1) := pipe(1)
+  } 
+
 }
 
 class OuterProductControl(implicit p: Parameters) extends CoreBundle()(p) with HasOPUParams {
@@ -143,6 +185,7 @@ class OuterProductControl(implicit p: Parameters) extends CoreBundle()(p) with H
   val mvin       = Vec(yDim, Bool())
   val mvin_bcast = Vec(yDim, Bool())
   val shift      = Vec(yDim, Bool())
+  val k_reduce   = Vec(yDim, Bool())
 }
 
 
@@ -179,7 +222,10 @@ class OuterProductUnit(implicit p: Parameters) extends CoreModule()(p) with HasO
 
     clusters(0)(j).io.in_pipe := 0.U
     for (i <- 1 until yDim) {
-      clusters(i)(j).io.in_pipe := clusters(i-1)(j).io.out_pipe
+      clusters(i)(j).io.in_pipe(0) := clusters(i-1)(j).io.out_pipe(0)
+      if (max_kfactor > 1) {
+        clusters(i)(j).io.in_pipe(1) := clusters(i-1)(j).io.out_pipe(1)
+      }
     }
     io.out(j) := clusters(yDim-1)(j).io.out_pipe
   }
